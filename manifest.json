@@ -1,7 +1,7 @@
 {
   "id": "daily-day-nav",
   "name": "Daily Day Nav",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "minAppVersion": "1.8.0",
   "description": "Open the previous or next calendar daily note, creating it from your template if it does not exist yet.",
   "author": "AntoineArt",
