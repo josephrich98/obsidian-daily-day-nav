@@ -15,6 +15,8 @@ The core **Daily notes** feature focuses on today. When you skip days in your jo
 
 If the target note does not exist yet, it is created using your Daily notes folder, format, and template settings.
 
+Date formats containing subfolders, such as `YYYY/MM/YYYY-MM-DD`, are fully supported: notes are found and created inside the matching year/month folders, which are created automatically when missing.
+
 ## Hotkeys
 
 1. Open **Settings → Hotkeys**

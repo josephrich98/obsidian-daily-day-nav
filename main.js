@@ -165,9 +165,18 @@ module.exports = class DailyDayNavPlugin extends Plugin {
     if (!parts.length) {
       return;
     }
-    const dir = joinPath(...parts);
-    if (!this.app.vault.getAbstractFileByPath(dir)) {
-      await this.app.vault.createFolder(dir);
+    let dir = "";
+    for (const part of parts) {
+      dir = dir ? `${dir}/${part}` : part;
+      if (!this.app.vault.getAbstractFileByPath(dir)) {
+        try {
+          await this.app.vault.createFolder(dir);
+        } catch (error) {
+          if (!this.app.vault.getAbstractFileByPath(dir)) {
+            throw error;
+          }
+        }
+      }
     }
   }
 
@@ -235,8 +244,8 @@ module.exports = class DailyDayNavPlugin extends Plugin {
   }
 
   async getDailyNotePath(date, settings) {
-    const filename = date.format(this.getFilenameFormat(settings));
-    const path = normalizePath(joinPath(settings.folder, `${filename}.md`));
+    const relativePath = date.format(settings.format);
+    const path = normalizePath(joinPath(settings.folder, `${relativePath}.md`));
     await this.ensureParentFolder(path);
     return path;
   }
