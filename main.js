@@ -27,7 +27,10 @@ const SINGLE_SWIPE_CLAIM_DISTANCE = 3;
 // Claim a downward drag early enough that Obsidian's pull-down command
 // palette never sees it; dismiss once the drag is clearly deliberate.
 const KEYBOARD_SWIPE_CLAIM_DISTANCE = 12;
-const KEYBOARD_SWIPE_DISMISS_DISTANCE = 50;
+const KEYBOARD_SWIPE_DISMISS_DISTANCE = 30;
+// Top fraction of the visible (above-keyboard) viewport left free for
+// scrolling; swipes starting below it dismiss the keyboard.
+const KEYBOARD_SWIPE_SCROLL_FRACTION = 0.4;
 
 const SWIPE_MIN_DISTANCE = 80;
 const SWIPE_MAX_DURATION_MS = 1500;
@@ -165,6 +168,15 @@ module.exports = class DailyDayNavPlugin extends Plugin {
           return;
         }
         const touch = event.touches[0];
+        // Ignore touches on the mobile toolbar/navbar so scrolling the
+        // toolbar horizontally doesn't trigger day navigation.
+        if (
+          event.target instanceof Element &&
+          event.target.closest(".mobile-toolbar, .mobile-navbar")
+        ) {
+          reset();
+          return;
+        }
         const width = window.innerWidth;
         const edge = width * SINGLE_SWIPE_EDGE_FRACTION;
         // Leave the outer edges to Obsidian's sidebar swipe.
@@ -305,6 +317,20 @@ module.exports = class DailyDayNavPlugin extends Plugin {
           return;
         }
         const touch = event.touches[0];
+        // Measure against the visual viewport (the area above the
+        // keyboard), not the full window: with the keyboard up, half the
+        // window can be keyboard, leaving almost no active zone.
+        const viewport = window.visualViewport;
+        const visibleTop = viewport?.offsetTop ?? 0;
+        const visibleHeight = viewport?.height ?? window.innerHeight;
+        // The top of the visible area stays free for scrolling.
+        if (
+          touch.clientY <
+          visibleTop + visibleHeight * KEYBOARD_SWIPE_SCROLL_FRACTION
+        ) {
+          reset();
+          return;
+        }
         // The pull-down palette only fires with the note scrolled to the
         // top; that is the only case where we must eat the events.
         const scroller = editable.closest?.(".cm-editor")?.querySelector(
