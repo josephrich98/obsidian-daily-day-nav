@@ -16,6 +16,7 @@ const DEFAULT_SETTINGS = {
   threeFingerSwipe: true,
   singleFingerSwipe: true,
   swipeDownDismissKeyboard: true,
+  holdHotkeyToRepeat: true,
 };
 
 const SWIPE_FINGER_COUNT = 3;
@@ -23,6 +24,12 @@ const SINGLE_SWIPE_EDGE_FRACTION = 0.05;
 // Claim on the first meaningful horizontal move so Obsidian's sidebar
 // drag never sees the gesture start (otherwise the sidebar "peeks").
 const SINGLE_SWIPE_CLAIM_DISTANCE = 3;
+// Don't judge the swipe's direction until the finger has travelled this
+// far: the first couple of move events are too jittery to trust.
+const SINGLE_SWIPE_LOCK_DISTANCE = 12;
+// Once locked, the swipe counts as horizontal while dx beats dy by this
+// ratio (~35 degrees of drift either way).
+const SINGLE_SWIPE_HORIZONTAL_RATIO = 1.5;
 
 // Claim a downward drag early enough that Obsidian's pull-down command
 // palette never sees it; dismiss once the drag is clearly deliberate.
@@ -32,9 +39,48 @@ const KEYBOARD_SWIPE_DISMISS_DISTANCE = 30;
 // scrolling; swipes starting below it dismiss the keyboard.
 const KEYBOARD_SWIPE_SCROLL_FRACTION = 0.4;
 
+// Minimum height the keyboard must take from the screen before the
+// viewport heuristic counts it as shown (status/nav bars are smaller).
+const KEYBOARD_MIN_HEIGHT = 150;
+
 const SWIPE_MIN_DISTANCE = 80;
 const SWIPE_MAX_DURATION_MS = 1500;
 const SWIPE_COOLDOWN_MS = 500;
+
+// Obsidian's hotkey system does not re-fire commands on OS key-repeat, so
+// holding the daily-note-navigation hotkey normally does nothing after the
+// first press. Our own repeat loop (see registerHoldHotkeyToRepeat) drives
+// navigation instead, pacing it with these: once the hold is confirmed it
+// repeats at the start interval and ramps to the fastest one over RAMP_MS.
+const HOLD_REPEAT_START_INTERVAL_MS = 260;
+const HOLD_REPEAT_FASTEST_INTERVAL_MS = 120;
+const HOLD_REPEAT_RAMP_MS = 1300;
+// Obsidian can fire the hotkey's command a few tens of ms before *or*
+// after the DOM keydown reaches us; the two are paired if within this.
+const HOLD_REPEAT_ASSOCIATION_WINDOW_MS = 250;
+// How often to check whether the OS auto-repeat stream has started.
+const HOLD_REPEAT_POLL_MS = 40;
+// A hold only counts once the OS starts auto-repeating the key (so a quick
+// tap never double-navigates); give up waiting for that after this long.
+const HOLD_REPEAT_FIRST_REPEAT_GRACE_MS = 1500;
+// Once repeating, the key is considered released when no auto-repeat
+// keydown has arrived for this long (macOS repeats every ~85ms).
+const HOLD_REPEAT_HEARTBEAT_MS = 400;
+// Absolute backstop: stop repeating after this long no matter what.
+const HOLD_REPEAT_MAX_DURATION_MS = 15000;
+
+// Physical keys we never treat as "the" hotkey - only as something held
+// alongside it - when figuring out which key is driving a hold-repeat.
+const HOLD_REPEAT_MODIFIER_CODES = new Set([
+  "MetaLeft",
+  "MetaRight",
+  "ControlLeft",
+  "ControlRight",
+  "AltLeft",
+  "AltRight",
+  "ShiftLeft",
+  "ShiftRight",
+]);
 
 const joinPath = (...segments) => {
   const parts = [];
@@ -54,6 +100,22 @@ const joinPath = (...segments) => {
   return normalized.join("/");
 };
 
+// The element that owns the on-screen keyboard, or null when it is hidden.
+const focusedEditable = () => {
+  const el = document.activeElement;
+  if (!el || el === document.body) {
+    return null;
+  }
+  if (
+    el.isContentEditable ||
+    el.tagName === "INPUT" ||
+    el.tagName === "TEXTAREA"
+  ) {
+    return el;
+  }
+  return null;
+};
+
 const getDateUID = (date, granularity = "day") => {
   const ts = date.clone().startOf(granularity).format();
   return `${granularity}-${ts}`;
@@ -66,10 +128,19 @@ module.exports = class DailyDayNavPlugin extends Plugin {
 
     if (Platform.isMobile) {
       this.trackActiveDailyNote();
+      this.trackKeyboard();
       this.registerSwipeGesture();
       this.registerSingleFingerSwipe();
       this.registerKeyboardDismissSwipe();
     }
+
+    this.holdRepeatState = {
+      hold: null,
+      lastPress: null,
+      lastCommand: null,
+      suppressed: new Set(),
+    };
+    this.registerHoldHotkeyToRepeat();
 
     this.addCommand({
       id: "open-previous-daily",
@@ -79,7 +150,7 @@ module.exports = class DailyDayNavPlugin extends Plugin {
         if (checking) {
           return this.canNavigateDailyNotes();
         }
-        void this.openDailyForOffset(-1);
+        this.triggerDailyNav(-1);
         return true;
       },
     });
@@ -92,7 +163,7 @@ module.exports = class DailyDayNavPlugin extends Plugin {
         if (checking) {
           return this.canNavigateDailyNotes();
         }
-        void this.openDailyForOffset(1);
+        this.triggerDailyNav(1);
         return true;
       },
     });
@@ -112,6 +183,221 @@ module.exports = class DailyDayNavPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  // Makes holding the previous/next daily-note hotkey keep navigating
+  // instead of requiring a fresh press each time.
+  //
+  // What the developer-console log showed on macOS, and what this design
+  // leans on:
+  //   - Obsidian fires the hotkey's command through a path that can beat
+  //     the DOM keydown to us by tens of ms (or trail it), so the two are
+  //     paired by time in either order rather than assuming one is first.
+  //   - Obsidian ignores OS auto-repeat, but the repeat keydowns still
+  //     reach us (~every 85ms) for exactly as long as the key is
+  //     physically down - even with Cmd held, when Chromium sends no keyup
+  //     for the key at all. That stream is the "still held" signal: we
+  //     don't start repeating until the first repeat confirms a real hold
+  //     (so a quick tap never double-navigates), and we stop as soon as it
+  //     goes quiet.
+  //   - If the modifier is let go first, the same repeats keep coming for
+  //     the bare key (now typing "]" / "}"); the hold ends on the modifier
+  //     change and those repeats are swallowed until the key's keyup or a
+  //     fresh (non-repeat) press.
+  registerHoldHotkeyToRepeat() {
+    const state = this.holdRepeatState;
+
+    this.registerDomEvent(
+      window,
+      "keydown",
+      (event) => {
+        const code = event.code;
+        if (HOLD_REPEAT_MODIFIER_CODES.has(code)) {
+          return;
+        }
+        const hold = state.hold;
+
+        if (event.repeat) {
+          if (hold && hold.code === code) {
+            if (this.modifiersMatch(hold.mods, event)) {
+              hold.sawRepeat = true;
+              hold.lastRepeatAt = Date.now();
+            } else {
+              // Modifier released while the key stayed down: the OS is
+              // now re-reporting the bare key as plain typing.
+              this.stopHold();
+              state.suppressed.add(code);
+            }
+            event.preventDefault();
+            return;
+          }
+          if (state.suppressed.has(code)) {
+            event.preventDefault();
+          }
+          return;
+        }
+
+        // A fresh press of this key.
+        state.suppressed.delete(code);
+        if (hold && hold.code === code) {
+          this.stopHold();
+        }
+        if (event.metaKey || event.ctrlKey || event.altKey) {
+          state.lastPress = {
+            code,
+            time: Date.now(),
+            mods: this.modifiersOf(event),
+          };
+          this.tryStartHold();
+        }
+      },
+      { capture: true }
+    );
+
+    this.registerDomEvent(
+      window,
+      "keyup",
+      (event) => {
+        const code = event.code;
+        state.suppressed.delete(code);
+        const hold = state.hold;
+        if (!hold) {
+          return;
+        }
+        if (hold.code === code) {
+          this.stopHold();
+        } else if (HOLD_REPEAT_MODIFIER_CODES.has(code)) {
+          // The bare key may still be down and about to type; swallow it.
+          state.suppressed.add(hold.code);
+          this.stopHold();
+        }
+      },
+      { capture: true }
+    );
+
+    this.registerDomEvent(window, "blur", () => {
+      state.suppressed.clear();
+      state.lastPress = null;
+      state.lastCommand = null;
+      this.stopHold();
+    });
+  }
+
+  modifiersOf(event) {
+    return {
+      meta: event.metaKey,
+      ctrl: event.ctrlKey,
+      alt: event.altKey,
+      shift: event.shiftKey,
+    };
+  }
+
+  modifiersMatch(mods, event) {
+    return (
+      mods.meta === event.metaKey &&
+      mods.ctrl === event.ctrlKey &&
+      mods.alt === event.altKey &&
+      mods.shift === event.shiftKey
+    );
+  }
+
+  triggerDailyNav(offset) {
+    void this.openDailyForOffset(offset);
+
+    if (!this.settings.holdHotkeyToRepeat) {
+      return;
+    }
+    this.holdRepeatState.lastCommand = { offset, time: Date.now() };
+    this.tryStartHold();
+  }
+
+  // Pairs the most recent hotkey command with the most recent
+  // modifier+key press if they happened close together, in either order.
+  tryStartHold() {
+    const state = this.holdRepeatState;
+    const { lastCommand, lastPress } = state;
+    if (state.hold || !lastCommand || !lastPress) {
+      return;
+    }
+    if (
+      Math.abs(lastCommand.time - lastPress.time) >
+      HOLD_REPEAT_ASSOCIATION_WINDOW_MS
+    ) {
+      return;
+    }
+    state.lastCommand = null;
+    state.lastPress = null;
+    this.startHold(lastPress.code, lastCommand.offset, lastPress.mods);
+  }
+
+  startHold(code, offset, mods) {
+    const state = this.holdRepeatState;
+    const hold = {
+      code,
+      offset,
+      mods,
+      startTime: Date.now(),
+      repeatingSince: 0,
+      sawRepeat: false,
+      lastRepeatAt: 0,
+      timer: null,
+    };
+    state.hold = hold;
+
+    // True while the key still counts as held: the hold hasn't been
+    // stopped, hasn't hit the cap, and either the OS repeat stream hasn't
+    // had time to start yet or it's still flowing.
+    const stillHeld = () => {
+      if (state.hold !== hold) {
+        return false;
+      }
+      const now = Date.now();
+      if (now - hold.startTime >= HOLD_REPEAT_MAX_DURATION_MS) {
+        return false;
+      }
+      if (!hold.sawRepeat) {
+        return now - hold.startTime < HOLD_REPEAT_FIRST_REPEAT_GRACE_MS;
+      }
+      return now - hold.lastRepeatAt < HOLD_REPEAT_HEARTBEAT_MS;
+    };
+
+    const tick = () => {
+      if (!stillHeld()) {
+        if (state.hold === hold) {
+          state.hold = null;
+        }
+        return;
+      }
+      if (!hold.sawRepeat) {
+        // Not yet confirmed as a real hold: keep polling until the OS
+        // repeat stream starts (or the grace period runs out).
+        hold.timer = window.setTimeout(tick, HOLD_REPEAT_POLL_MS);
+        return;
+      }
+      if (!hold.repeatingSince) {
+        hold.repeatingSince = Date.now();
+      }
+      void this.openDailyForOffset(offset);
+
+      const elapsed = Date.now() - hold.repeatingSince;
+      const progress = Math.min(1, elapsed / HOLD_REPEAT_RAMP_MS);
+      const interval =
+        HOLD_REPEAT_START_INTERVAL_MS -
+        (HOLD_REPEAT_START_INTERVAL_MS - HOLD_REPEAT_FASTEST_INTERVAL_MS) *
+          progress;
+      hold.timer = window.setTimeout(tick, interval);
+    };
+    hold.timer = window.setTimeout(tick, HOLD_REPEAT_POLL_MS);
+  }
+
+  stopHold() {
+    const state = this.holdRepeatState;
+    const hold = state.hold;
+    if (!hold) {
+      return;
+    }
+    window.clearTimeout(hold.timer);
+    state.hold = null;
   }
 
   trackActiveDailyNote() {
@@ -147,6 +433,41 @@ module.exports = class DailyDayNavPlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => void update());
   }
 
+  trackKeyboard() {
+    // Capacitor's Keyboard plugin broadcasts these on window; focus alone
+    // is not reliable because Obsidian can keep the editor focused with
+    // the keyboard hidden.
+    this.keyboardShown = false;
+    for (const name of ["keyboardWillShow", "keyboardDidShow"]) {
+      this.registerDomEvent(window, name, () => {
+        this.keyboardShown = true;
+      });
+    }
+    for (const name of ["keyboardWillHide", "keyboardDidHide"]) {
+      this.registerDomEvent(window, name, () => {
+        this.keyboardShown = false;
+      });
+    }
+  }
+
+  isKeyboardVisible() {
+    if (!focusedEditable()) {
+      return false;
+    }
+    if (this.keyboardShown) {
+      return true;
+    }
+    // Fallback when the keyboard events never fired: the keyboard eats a
+    // large slice of the screen, shrinking either the window itself
+    // (native resize) or the visual viewport (overlay).
+    const viewport = window.visualViewport;
+    const visible = Math.min(
+      window.innerHeight,
+      viewport?.height ?? Infinity
+    );
+    return window.screen.height - visible >= KEYBOARD_MIN_HEIGHT;
+  }
+
   registerSingleFingerSwipe() {
     let gesture = null;
     let lastSwipeAt = 0;
@@ -159,10 +480,13 @@ module.exports = class DailyDayNavPlugin extends Plugin {
       document,
       "touchstart",
       (event) => {
+        // Only while the keyboard is up: with it hidden a horizontal drag
+        // is far more likely to be text selection than navigation.
         if (
           !this.settings.singleFingerSwipe ||
           !this.activeFileIsDaily ||
-          event.touches.length !== 1
+          event.touches.length !== 1 ||
+          !this.isKeyboardVisible()
         ) {
           reset();
           return;
@@ -214,20 +538,23 @@ module.exports = class DailyDayNavPlugin extends Plugin {
         gesture.y = touch.clientY;
 
         if (!gesture.claimed) {
-          const dx = gesture.x - gesture.startX;
-          const dy = gesture.y - gesture.startY;
-          if (Math.abs(dy) > Math.abs(dx)) {
-            // Vertical intent: this is a scroll, stay out of the way.
-            reset();
+          const dx = Math.abs(gesture.x - gesture.startX);
+          const dy = Math.abs(gesture.y - gesture.startY);
+          if (Math.max(dx, dy) >= SINGLE_SWIPE_LOCK_DISTANCE) {
+            if (dx < dy * SINGLE_SWIPE_HORIZONTAL_RATIO) {
+              // Vertical intent: this is a scroll, stay out of the way.
+              reset();
+              return;
+            }
+            gesture.claimed = true;
+          } else if (dx < SINGLE_SWIPE_CLAIM_DISTANCE || dx < dy) {
+            // Still inside the dead zone and not leaning horizontal yet.
             return;
           }
-          if (Math.abs(dx) >= SINGLE_SWIPE_CLAIM_DISTANCE) {
-            gesture.claimed = true;
-          }
+          // Leaning horizontal but not yet locked: swallow the move so the
+          // sidebar drag can't start, but keep watching the direction.
         }
-        if (gesture.claimed) {
-          event.stopPropagation();
-        }
+        event.stopPropagation();
       },
       { capture: true, passive: true }
     );
@@ -263,7 +590,7 @@ module.exports = class DailyDayNavPlugin extends Plugin {
         const dy = touch.clientY - finished.startY;
         if (
           Math.abs(dx) >= SWIPE_MIN_DISTANCE &&
-          Math.abs(dx) > Math.abs(dy) * 2 &&
+          Math.abs(dx) >= Math.abs(dy) * SINGLE_SWIPE_HORIZONTAL_RATIO &&
           Date.now() - finished.startTime <= SWIPE_MAX_DURATION_MS &&
           Date.now() - lastSwipeAt >= SWIPE_COOLDOWN_MS
         ) {
@@ -280,21 +607,6 @@ module.exports = class DailyDayNavPlugin extends Plugin {
 
     const reset = () => {
       gesture = null;
-    };
-
-    const focusedEditable = () => {
-      const el = document.activeElement;
-      if (!el || el === document.body) {
-        return null;
-      }
-      if (
-        el.isContentEditable ||
-        el.tagName === "INPUT" ||
-        el.tagName === "TEXTAREA"
-      ) {
-        return el;
-      }
-      return null;
     };
 
     const hideKeyboard = (el) => {
@@ -811,6 +1123,20 @@ class DailyDayNavSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     new Setting(containerEl)
+      .setName("Hold hotkey to repeat navigation")
+      .setDesc(
+        "Holding down the previous/next daily note hotkey keeps navigating, speeding up the longer you hold it."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.holdHotkeyToRepeat)
+          .onChange(async (value) => {
+            this.plugin.settings.holdHotkeyToRepeat = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("Three-finger swipe navigation (mobile)")
       .setDesc(
         "Swipe left with three fingers to open the next daily note, right for the previous one."
@@ -827,7 +1153,7 @@ class DailyDayNavSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Single-finger swipe in daily notes (mobile)")
       .setDesc(
-        "While a daily note is open, swiping in the middle 90% of the screen opens the next (left) or previous (right) daily note instead of the sidebars. Swipes starting in the outer 5% edges still open the sidebars."
+        "While a daily note is open and the keyboard is showing, swiping in the middle 90% of the screen opens the next (left) or previous (right) daily note instead of the sidebars. Swipes starting in the outer 5% edges still open the sidebars."
       )
       .addToggle((toggle) =>
         toggle
